@@ -6,9 +6,17 @@ from datetime import date, datetime
 from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
-from app.core.errors import ConflictError, ValidationError
+from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.germplasm.inventory import InventoryService
 from app.germplasm.repository import GermplasmRepository, record, records
+
+
+def risk_for_germination(germination: float) -> str:
+    if germination < 70:
+        return "high"
+    if germination < 85:
+        return "medium"
+    return "low"
 
 
 class ViabilityService:
@@ -215,22 +223,46 @@ class ViabilityService:
         timestamp = to_storage(self.clock.now())
         cursor = self.connection.execute(
             "INSERT INTO retest_policies(crop_name,risk_level,interval_months,warning_days,minimum_germination_percent,"
-            "effective_from,effective_to,version,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "effective_from,effective_to,version,status,published_by,published_at,created_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'published',?,?,?,?)",
             (
                 data["crop_name"], data["risk_level"], data["interval_months"], data["warning_days"],
                 data["minimum_germination_percent"], data["effective_from"], data.get("effective_to"), version,
-                data["created_by"], timestamp,
+                data["created_by"], timestamp, data["created_by"], timestamp,
             ),
         )
         return self.repository.require_policy(int(cursor.lastrowid))
 
     def due_schedules(self, before: date, limit: int = 100) -> list[dict[str, Any]]:
         return records(self.connection.execute(
-            "SELECT s.*,l.lot_no,a.accession_no,a.crop_name FROM retest_schedules s "
+            "SELECT s.*,l.lot_no,a.accession_no,a.crop_name,p.version AS policy_version,"
+            "p.interval_months AS policy_interval_months,p.status AS policy_status "
+            "FROM retest_schedules s "
             "JOIN seed_lots l ON l.id=s.lot_id JOIN accessions a ON a.id=l.accession_id "
+            "JOIN retest_policies p ON p.id=s.policy_id "
             "WHERE s.status IN ('pending','notified') AND s.due_on<=? ORDER BY s.due_on,l.lot_no LIMIT ?",
             (before.isoformat(), limit),
         ).fetchall())
+
+    def waive_schedule(self, schedule_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        row = record(self.connection.execute(
+            "SELECT * FROM retest_schedules WHERE id=?", (schedule_id,)
+        ).fetchone())
+        if row is None:
+            raise NotFoundError("复检日程不存在")
+        if row["status"] not in {"pending", "notified"}:
+            raise ConflictError("只有待执行的复检日程可以人工豁免")
+        timestamp = to_storage(self.clock.now())
+        cursor = self.connection.execute(
+            "UPDATE retest_schedules SET status='waived',waived_by=?,waived_at=?,waive_reason=?,updated_at=? "
+            "WHERE id=? AND status IN ('pending','notified')",
+            (data["actor"], timestamp, data["reason"], timestamp, schedule_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("复检日程状态已变化，无法豁免")
+        return record(self.connection.execute(
+            "SELECT * FROM retest_schedules WHERE id=?", (schedule_id,)
+        ).fetchone()) or {}
 
     def mark_notifications(self, schedule_ids: list[int]) -> int:
         if not schedule_ids:
@@ -257,7 +289,7 @@ class ViabilityService:
         test = self.repository.require_test(test_id)
         lot = self.repository.require_lot(int(test["lot_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
-        risk = "high" if germination < 70 else ("medium" if germination < 85 else "low")
+        risk = risk_for_germination(germination)
         completed_date = datetime.fromisoformat(timestamp).date()
         policy = self.repository.applicable_policy(accession["crop_name"], risk, completed_date.isoformat())
         if policy is None:

@@ -307,6 +307,14 @@ CREATE TABLE IF NOT EXISTS retest_policies (
     effective_from TEXT NOT NULL,
     effective_to TEXT,
     version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('draft','approved','published','superseded')),
+    change_note TEXT NOT NULL DEFAULT '',
+    source_policy_id INTEGER REFERENCES retest_policies(id),
+    approved_by TEXT,
+    approved_at TEXT,
+    published_by TEXT,
+    published_at TEXT,
+    superseded_at TEXT,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(crop_name,risk_level,version)
@@ -319,11 +327,72 @@ CREATE TABLE IF NOT EXISTS retest_schedules (
     due_on TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','notified','scheduled','superseded','waived')),
     reason TEXT NOT NULL,
+    waived_by TEXT,
+    waived_at TEXT,
+    waive_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(lot_id,due_on)
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON retest_schedules(status,due_on);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_single_active ON retest_schedules(lot_id)
+    WHERE status IN ('pending','notified');
+CREATE TABLE IF NOT EXISTS retest_policy_previews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id INTEGER NOT NULL UNIQUE REFERENCES retest_policies(id) ON DELETE CASCADE,
+    as_of TEXT NOT NULL,
+    affected_lots INTEGER NOT NULL DEFAULT 0,
+    recompute_count INTEGER NOT NULL DEFAULT 0,
+    confirm_count INTEGER NOT NULL DEFAULT 0,
+    create_count INTEGER NOT NULL DEFAULT 0,
+    conflict_count INTEGER NOT NULL DEFAULT 0,
+    becomes_overdue_count INTEGER NOT NULL DEFAULT 0,
+    no_longer_overdue_count INTEGER NOT NULL DEFAULT 0,
+    notify_count INTEGER NOT NULL DEFAULT 0,
+    computed_by TEXT NOT NULL,
+    computed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retest_policy_preview_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    preview_id INTEGER NOT NULL REFERENCES retest_policy_previews(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id),
+    action TEXT NOT NULL,
+    source_test_id INTEGER,
+    old_due_on TEXT,
+    new_due_on TEXT,
+    old_overdue INTEGER NOT NULL DEFAULT 0 CHECK(old_overdue IN (0,1)),
+    new_overdue INTEGER NOT NULL DEFAULT 0 CHECK(new_overdue IN (0,1)),
+    detail TEXT NOT NULL DEFAULT '',
+    UNIQUE(preview_id,lot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_preview_items ON retest_policy_preview_items(preview_id,action);
+CREATE TABLE IF NOT EXISTS retest_policy_publications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id INTEGER NOT NULL UNIQUE REFERENCES retest_policies(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed')),
+    total_lots INTEGER NOT NULL DEFAULT 0,
+    processed_lots INTEGER NOT NULL DEFAULT 0,
+    notifications_enqueued INTEGER NOT NULL DEFAULT 0,
+    cursor_lot_id INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retest_policy_publication_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publication_id INTEGER NOT NULL REFERENCES retest_policy_publications(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id),
+    action TEXT NOT NULL,
+    schedule_id INTEGER REFERENCES retest_schedules(id),
+    old_due_on TEXT,
+    new_due_on TEXT,
+    notification_key TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(publication_id,lot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_items ON retest_policy_publication_items(publication_id,action);
 
 CREATE TABLE IF NOT EXISTS environment_readings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -468,10 +537,42 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_retest_policy_schema(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐复检策略生命周期与日程豁免字段（新库已由 SCHEMA 建全）。"""
+    policy_columns = {row[1] for row in connection.execute("PRAGMA table_info(retest_policies)")}
+    policy_additions = [
+        ("status", "ALTER TABLE retest_policies ADD COLUMN status TEXT NOT NULL DEFAULT 'published'"),
+        ("change_note", "ALTER TABLE retest_policies ADD COLUMN change_note TEXT NOT NULL DEFAULT ''"),
+        ("source_policy_id", "ALTER TABLE retest_policies ADD COLUMN source_policy_id INTEGER REFERENCES retest_policies(id)"),
+        ("approved_by", "ALTER TABLE retest_policies ADD COLUMN approved_by TEXT"),
+        ("approved_at", "ALTER TABLE retest_policies ADD COLUMN approved_at TEXT"),
+        ("published_by", "ALTER TABLE retest_policies ADD COLUMN published_by TEXT"),
+        ("published_at", "ALTER TABLE retest_policies ADD COLUMN published_at TEXT"),
+        ("superseded_at", "ALTER TABLE retest_policies ADD COLUMN superseded_at TEXT"),
+    ]
+    for column, ddl in policy_additions:
+        if column not in policy_columns:
+            connection.execute(ddl)
+    schedule_columns = {row[1] for row in connection.execute("PRAGMA table_info(retest_schedules)")}
+    schedule_additions = [
+        ("waived_by", "ALTER TABLE retest_schedules ADD COLUMN waived_by TEXT"),
+        ("waived_at", "ALTER TABLE retest_schedules ADD COLUMN waived_at TEXT"),
+        ("waive_reason", "ALTER TABLE retest_schedules ADD COLUMN waive_reason TEXT"),
+    ]
+    for column, ddl in schedule_additions:
+        if column not in schedule_columns:
+            connection.execute(ddl)
+    connection.execute(
+        "UPDATE retest_policies SET published_at=created_at, published_by=created_by "
+        "WHERE status='published' AND published_at IS NULL"
+    )
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_retest_policy_schema(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

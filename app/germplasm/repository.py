@@ -177,9 +177,34 @@ class GermplasmRepository:
 
     def applicable_policy(self, crop_name: str, risk_level: str, on_date: str) -> dict[str, Any] | None:
         return record(self.connection.execute(
-            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND effective_from<=? "
-            "AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
+            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND status='published' "
+            "AND effective_from<=? AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
             (crop_name, risk_level, on_date, on_date),
+        ).fetchone())
+
+    def policy_as_of(self, crop_name: str, risk_level: str, moment: str, on_date: str) -> dict[str, Any] | None:
+        """返回某时点实际生效的策略版本：当时已发布且尚未被取代，并落在生效区间内。"""
+        return record(self.connection.execute(
+            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND status IN ('published','superseded') "
+            "AND published_at IS NOT NULL AND published_at<=? AND (superseded_at IS NULL OR superseded_at>?) "
+            "AND effective_from<=? AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
+            (crop_name, risk_level, moment, moment, on_date, on_date),
+        ).fetchone())
+
+    def latest_completed_test(self, lot_id: int, before: str | None = None) -> dict[str, Any] | None:
+        clause = "AND completed_at<=?" if before else ""
+        params: tuple[Any, ...] = (lot_id, before) if before else (lot_id,)
+        return record(self.connection.execute(
+            f"SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' {clause} "
+            "ORDER BY completed_at DESC,id DESC LIMIT 1",
+            params,
+        ).fetchone())
+
+    def active_retest_schedule(self, lot_id: int) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM retest_schedules WHERE lot_id=? AND status IN ('pending','notified') "
+            "ORDER BY due_on,id LIMIT 1",
+            (lot_id,),
         ).fetchone())
 
     def require_alert(self, alert_id: int) -> dict[str, Any]:

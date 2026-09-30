@@ -22,9 +22,15 @@ from app.germplasm.schemas import (
     LotCreate,
     MovePlacement,
     PlacementCreate,
+    PolicyApprove,
     PolicyCreate,
+    PolicyPreviewRequest,
+    PolicyPublish,
+    PolicyRevisionCreate,
+    PolicyRollbackCreate,
     ProtocolCreate,
     ReadingCreate,
+    ScheduleWaive,
     SourceCreate,
     TestComplete,
     TestCreate,
@@ -269,6 +275,119 @@ def create_policy(data: PolicyCreate, principal: Principal = Depends(current_pri
     principal.require("quality.review")
     with transaction(immediate=True) as connection:
         return GermplasmService(connection).viability.create_policy(data.model_dump(mode="json"))
+
+
+@router.post("/policy-revisions", status_code=201)
+def create_policy_revision(data: PolicyRevisionCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_revisions.create_revision(data.model_dump(mode="json"))
+
+
+@router.post("/policy-revisions/rollback", status_code=201)
+def rollback_policy(data: PolicyRollbackCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_revisions.rollback(data.model_dump(mode="json"))
+
+
+@router.get("/policy-revisions")
+def list_policy_revisions(
+    crop_name: str | None = None,
+    risk_level: str | None = None,
+    status: str | None = None,
+    principal: Principal = Depends(current_principal),
+) -> list[dict]:
+    principal.require("viability.read")
+    return _service().policy_revisions.list_revisions(crop_name, risk_level, status)
+
+
+@router.get("/policy-revisions/{revision_id}")
+def policy_revision_detail(revision_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("viability.read")
+    return _service().policy_revisions.revision_detail(revision_id)
+
+
+@router.post("/policy-revisions/{revision_id}/preview")
+def preview_policy_revision(
+    revision_id: int,
+    data: PolicyPreviewRequest,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_revisions.preview(revision_id, data.model_dump(mode="json"))
+
+
+@router.get("/policy-revisions/{revision_id}/preview")
+def policy_preview_detail(
+    revision_id: int,
+    limit: int = Query(default=100, ge=0, le=500),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("viability.read")
+    return _service().policy_revisions.get_preview(revision_id, limit=limit, offset=offset)
+
+
+@router.get("/policy-revisions/{revision_id}/conflicts")
+def policy_preview_conflicts(revision_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("viability.read")
+    return _service().policy_revisions.conflicts(revision_id)
+
+
+@router.post("/policy-revisions/{revision_id}/approve")
+def approve_policy_revision(
+    revision_id: int,
+    data: PolicyApprove,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_revisions.approve(revision_id, data.model_dump(mode="json"))
+
+
+@router.post("/policy-revisions/{revision_id}/publish")
+def publish_policy_revision(
+    revision_id: int,
+    data: PolicyPublish,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    # 发布按批次自行管理事务并记录断点，不能在路由层包一个大事务
+    return GermplasmService(get_connection()).policy_revisions.publish(revision_id, data.model_dump(mode="json"))
+
+
+@router.get("/policy-revisions/{revision_id}/due-list")
+def policy_due_list(
+    revision_id: int,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("viability.read")
+    return _service().policy_revisions.due_list(revision_id, limit=limit, offset=offset)
+
+
+@router.get("/lots/{lot_id}/retest-explanation")
+def retest_explanation(
+    lot_id: int,
+    as_of: str | None = None,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("viability.read")
+    return _service().policy_revisions.explain_lot(lot_id, as_of)
+
+
+@router.post("/retest-schedules/{schedule_id}/waive")
+def waive_retest_schedule(
+    schedule_id: int,
+    data: ScheduleWaive,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).viability.waive_schedule(schedule_id, data.model_dump(mode="json"))
 
 
 @router.get("/retest-schedules/due")

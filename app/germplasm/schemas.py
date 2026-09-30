@@ -264,6 +264,59 @@ class PolicyCreate(BaseModel):
         return self
 
 
+class PolicyRevisionCreate(BaseModel):
+    crop_name: str = Field(min_length=1, max_length=100)
+    risk_level: str = Field(pattern="^(low|medium|high)$")
+    interval_months: int = Field(gt=0, le=240)
+    warning_days: int = Field(ge=0, le=365)
+    minimum_germination_percent: float = Field(ge=0, le=100)
+    effective_from: date
+    effective_to: date | None = None
+    change_note: str = Field(default="", max_length=500)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "PolicyRevisionCreate":
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValueError("策略失效日期不能早于生效日期")
+        return self
+
+
+class PolicyRollbackCreate(BaseModel):
+    crop_name: str = Field(min_length=1, max_length=100)
+    risk_level: str = Field(pattern="^(low|medium|high)$")
+    target_version: int = Field(gt=0)
+    effective_from: date
+    effective_to: date | None = None
+    change_note: str = Field(default="", max_length=500)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "PolicyRollbackCreate":
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValueError("策略失效日期不能早于生效日期")
+        return self
+
+
+class PolicyPreviewRequest(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class PolicyApprove(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+
+class PolicyPublish(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    batch_size: int | None = Field(default=None, gt=0, le=10000)
+
+
+class ScheduleWaive(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
 class ReadingCreate(BaseModel):
     location_id: int = Field(gt=0)
     observed_at: datetime
