@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -13,6 +13,7 @@ from app.germplasm.schemas import (
     AccessionPatch,
     AccessionTransition,
     AlertDecision,
+    CampaignActor,
     CountCreate,
     DistributionCreate,
     DistributionDecision,
@@ -22,9 +23,11 @@ from app.germplasm.schemas import (
     LotCreate,
     MovePlacement,
     PlacementCreate,
+    PolicyCampaignCreate,
     PolicyCreate,
     ProtocolCreate,
     ReadingCreate,
+    ScheduleWaive,
     SourceCreate,
     TestComplete,
     TestCreate,
@@ -269,6 +272,110 @@ def create_policy(data: PolicyCreate, principal: Principal = Depends(current_pri
     principal.require("quality.review")
     with transaction(immediate=True) as connection:
         return GermplasmService(connection).viability.create_policy(data.model_dump(mode="json"))
+
+
+@router.post("/policy-campaigns", status_code=201)
+def create_policy_campaign(data: PolicyCampaignCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.create_campaign(data.model_dump(mode="json"))
+
+
+@router.get("/policy-campaigns")
+def list_policy_campaigns(
+    status: str | None = None,
+    principal: Principal = Depends(current_principal),
+) -> list[dict]:
+    principal.require("quality.review")
+    return _service().policy_campaigns.list_campaigns(status)
+
+
+@router.get("/policy-campaigns/{campaign_id}")
+def policy_campaign_detail(campaign_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    return _service().policy_campaigns.campaign_detail(campaign_id)
+
+
+@router.get("/policy-campaigns/{campaign_id}/items")
+def policy_campaign_items(campaign_id: int, principal: Principal = Depends(current_principal)) -> list[dict]:
+    principal.require("quality.review")
+    return _service().policy_campaigns.list_items(campaign_id)
+
+
+@router.get("/policy-campaigns/{campaign_id}/schedules")
+def policy_campaign_schedules(campaign_id: int, principal: Principal = Depends(current_principal)) -> list[dict]:
+    principal.require("viability.read")
+    return _service().policy_campaigns.schedules(campaign_id)
+
+
+@router.post("/policy-campaigns/{campaign_id}/preview")
+def preview_policy_campaign(campaign_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.preview(campaign_id)
+
+
+@router.post("/policy-campaigns/{campaign_id}/approve")
+def approve_policy_campaign(
+    campaign_id: int,
+    data: CampaignActor,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.approve(campaign_id, data.actor)
+
+
+@router.post("/policy-campaigns/{campaign_id}/publish")
+def publish_policy_campaign(
+    campaign_id: int,
+    data: CampaignActor,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.publish(campaign_id, data.actor)
+
+
+@router.post("/policy-campaigns/{campaign_id}/apply")
+def apply_policy_campaign(campaign_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("quality.review")
+    # 不在请求级事务中执行：每条明细独立提交，中断后可从断点继续
+    return _service().policy_campaigns.apply(campaign_id)
+
+
+@router.post("/policy-campaigns/{campaign_id}/rollback", status_code=201)
+def rollback_policy_campaign(
+    campaign_id: int,
+    data: CampaignActor,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.rollback(campaign_id, data.actor)
+
+
+@router.get("/lots/{lot_id}/retest-explanation")
+def retest_explanation(
+    lot_id: int,
+    as_of: datetime | None = None,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("viability.read")
+    return _service().policy_campaigns.explain_lot(lot_id, as_of)
+
+
+@router.post("/retest-schedules/{schedule_id}/waive")
+def waive_retest_schedule(
+    schedule_id: int,
+    data: ScheduleWaive,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("quality.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).policy_campaigns.waive_schedule(
+            schedule_id, data.actor, data.reason
+        )
 
 
 @router.get("/retest-schedules/due")

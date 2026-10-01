@@ -177,10 +177,27 @@ class GermplasmRepository:
 
     def applicable_policy(self, crop_name: str, risk_level: str, on_date: str) -> dict[str, Any] | None:
         return record(self.connection.execute(
-            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND effective_from<=? "
-            "AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
+            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND status='published' "
+            "AND effective_from<=? AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
             (crop_name, risk_level, on_date, on_date),
         ).fetchone())
+
+    def policy_as_of(self, crop_name: str, risk_level: str, as_of: str) -> dict[str, Any] | None:
+        on_date = as_of[:10]
+        return record(self.connection.execute(
+            "SELECT * FROM retest_policies WHERE crop_name=? AND risk_level=? AND status='published' "
+            "AND (published_at IS NULL OR published_at<=?) AND effective_from<=? "
+            "AND (effective_to IS NULL OR effective_to>=?) ORDER BY version DESC LIMIT 1",
+            (crop_name, risk_level, as_of, on_date, on_date),
+        ).fetchone())
+
+    def require_campaign(self, campaign_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute(
+            "SELECT * FROM retest_policy_campaigns WHERE id=?", (campaign_id,)
+        ).fetchone())
+        if item is None:
+            raise NotFoundError("策略升级活动不存在")
+        return item
 
     def require_alert(self, alert_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM quality_alerts WHERE id=?", (alert_id,)).fetchone())

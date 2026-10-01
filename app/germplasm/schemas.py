@@ -264,6 +264,31 @@ class PolicyCreate(BaseModel):
         return self
 
 
+class PolicyCampaignCreate(BaseModel):
+    crop_name: str = Field(min_length=1, max_length=100)
+    risk_level: str = Field(pattern="^(low|medium|high)$")
+    interval_months: int = Field(gt=0, le=240)
+    warning_days: int = Field(ge=0, le=365)
+    minimum_germination_percent: float = Field(ge=0, le=100)
+    effective_from: date
+    note: str = Field(default="", max_length=500)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @field_validator("crop_name")
+    @classmethod
+    def strip_crop(cls, value: str) -> str:
+        return value.strip()
+
+
+class CampaignActor(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class ScheduleWaive(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
 class ReadingCreate(BaseModel):
     location_id: int = Field(gt=0)
     observed_at: datetime

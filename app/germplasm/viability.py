@@ -215,11 +215,12 @@ class ViabilityService:
         timestamp = to_storage(self.clock.now())
         cursor = self.connection.execute(
             "INSERT INTO retest_policies(crop_name,risk_level,interval_months,warning_days,minimum_germination_percent,"
-            "effective_from,effective_to,version,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "effective_from,effective_to,version,status,published_at,created_by,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'published',?,?,?)",
             (
                 data["crop_name"], data["risk_level"], data["interval_months"], data["warning_days"],
                 data["minimum_germination_percent"], data["effective_from"], data.get("effective_to"), version,
-                data["created_by"], timestamp,
+                timestamp, data["created_by"], timestamp,
             ),
         )
         return self.repository.require_policy(int(cursor.lastrowid))
@@ -257,7 +258,7 @@ class ViabilityService:
         test = self.repository.require_test(test_id)
         lot = self.repository.require_lot(int(test["lot_id"]))
         accession = self.repository.require_accession(int(lot["accession_id"]))
-        risk = "high" if germination < 70 else ("medium" if germination < 85 else "low")
+        risk = risk_for_germination(germination)
         completed_date = datetime.fromisoformat(timestamp).date()
         policy = self.repository.applicable_policy(accession["crop_name"], risk, completed_date.isoformat())
         if policy is None:
@@ -282,6 +283,14 @@ class ViabilityService:
             "VALUES(?,'low_viability','critical',?,?,?,?,?)",
             (key, test["lot_id"], f"批次活力降至 {germination:.2f}%", json.dumps({"test_id": test_id, "value": germination}), timestamp, timestamp),
         )
+
+
+def risk_for_germination(germination: float) -> str:
+    if germination < 70:
+        return "high"
+    if germination < 85:
+        return "medium"
+    return "low"
 
 
 def add_months(value: date, months: int) -> date:

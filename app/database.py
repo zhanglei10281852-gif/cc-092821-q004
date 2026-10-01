@@ -307,6 +307,8 @@ CREATE TABLE IF NOT EXISTS retest_policies (
     effective_from TEXT NOT NULL,
     effective_to TEXT,
     version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'published' CHECK(status IN ('candidate','published')),
+    published_at TEXT,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(crop_name,risk_level,version)
@@ -319,11 +321,60 @@ CREATE TABLE IF NOT EXISTS retest_schedules (
     due_on TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','notified','scheduled','superseded','waived')),
     reason TEXT NOT NULL,
+    waived_by TEXT,
+    waived_at TEXT,
+    waived_reason TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(lot_id,due_on)
+    updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_due ON retest_schedules(status,due_on);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_active_due ON retest_schedules(lot_id,due_on)
+WHERE status IN ('pending','notified','scheduled');
+CREATE TABLE IF NOT EXISTS retest_policy_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_no TEXT NOT NULL UNIQUE,
+    crop_name TEXT NOT NULL,
+    risk_level TEXT NOT NULL CHECK(risk_level IN ('low','medium','high')),
+    interval_months INTEGER NOT NULL CHECK(interval_months > 0),
+    warning_days INTEGER NOT NULL CHECK(warning_days >= 0),
+    minimum_germination_percent REAL NOT NULL CHECK(minimum_germination_percent BETWEEN 0 AND 100),
+    effective_from TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    policy_id INTEGER NOT NULL REFERENCES retest_policies(id) ON DELETE RESTRICT,
+    rollback_of INTEGER REFERENCES retest_policy_campaigns(id),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','previewed','approved','published','applying','applied')),
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL,
+    approved_by TEXT,
+    approved_at TEXT,
+    published_by TEXT,
+    published_at TEXT,
+    applied_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_campaigns_crop ON retest_policy_campaigns(crop_name,risk_level,status);
+CREATE TABLE IF NOT EXISTS retest_policy_campaign_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL REFERENCES retest_policy_campaigns(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
+    source_test_id INTEGER REFERENCES viability_tests(id),
+    germination_percent REAL,
+    old_schedule_id INTEGER REFERENCES retest_schedules(id),
+    old_policy_id INTEGER REFERENCES retest_policies(id),
+    old_due_on TEXT,
+    new_due_on TEXT,
+    change_type TEXT NOT NULL DEFAULT 'conflict' CHECK(change_type IN ('earlier','later','unchanged','conflict')),
+    overdue_change TEXT CHECK(overdue_change IN ('newly_overdue','cured_overdue','still_overdue','not_overdue')),
+    conflict TEXT CHECK(conflict IN ('already_scheduled','manually_waived','no_active_schedule')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done','skipped','failed')),
+    new_schedule_id INTEGER REFERENCES retest_schedules(id),
+    error TEXT,
+    processed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(campaign_id,lot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_items_status ON retest_policy_campaign_items(campaign_id,status);
 
 CREATE TABLE IF NOT EXISTS environment_readings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -454,7 +505,7 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         try:
             yield connection
             connection.execute(f"RELEASE SAVEPOINT {marker}")
-        except Exception:
+        except BaseException:
             connection.execute(f"ROLLBACK TO SAVEPOINT {marker}")
             connection.execute(f"RELEASE SAVEPOINT {marker}")
             raise
@@ -463,15 +514,74 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     try:
         yield connection
         connection.commit()
-    except Exception:
+    except BaseException:
         connection.rollback()
         raise
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if existing and column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
+def _rebuild_retest_schedules_if_needed() -> None:
+    """旧库的 retest_schedules 带表级 UNIQUE(lot_id,due_on)，会让回滚后与历史日程同日的
+    新日程无法插入。重建为部分唯一索引（仅约束有效日程），历史行保持只读。"""
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='retest_schedules'"
+    ).fetchone()
+    if row is None:
+        return
+    normalized = row[0].replace(" ", "").replace("\n", "").upper()
+    if "UNIQUE(LOT_ID,DUE_ON)" not in normalized:
+        return
+    legacy_columns = {r[1] for r in connection.execute("PRAGMA table_info(retest_schedules)").fetchall()}
+    waived_select = [c if c in legacy_columns else f"NULL AS {c}" for c in ("waived_by", "waived_at", "waived_reason")]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(immediate=True) as migrated:
+            migrated.execute("ALTER TABLE retest_schedules RENAME TO retest_schedules_legacy")
+            migrated.execute(
+                "CREATE TABLE retest_schedules ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,"
+                "source_test_id INTEGER REFERENCES viability_tests(id),"
+                "policy_id INTEGER NOT NULL REFERENCES retest_policies(id) ON DELETE RESTRICT,"
+                "due_on TEXT NOT NULL,"
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending','notified','scheduled','superseded','waived')),"
+                "reason TEXT NOT NULL,"
+                "waived_by TEXT,waived_at TEXT,waived_reason TEXT,"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"
+            )
+            migrated.execute(
+                "INSERT INTO retest_schedules(id,lot_id,source_test_id,policy_id,due_on,status,reason,"
+                "waived_by,waived_at,waived_reason,created_at,updated_at) "
+                "SELECT id,lot_id,source_test_id,policy_id,due_on,status,reason,"
+                f"{','.join(waived_select)},created_at,updated_at FROM retest_schedules_legacy"
+            )
+            migrated.execute("DROP TABLE retest_schedules_legacy")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    _ensure_column(connection, "retest_policies", "status", "status TEXT NOT NULL DEFAULT 'published'")
+    _ensure_column(connection, "retest_policies", "published_at", "published_at TEXT")
+    _ensure_column(connection, "retest_schedules", "waived_by", "waived_by TEXT")
+    _ensure_column(connection, "retest_schedules", "waived_at", "waived_at TEXT")
+    _ensure_column(connection, "retest_schedules", "waived_reason", "waived_reason TEXT")
+    connection.execute("UPDATE retest_policies SET published_at=created_at WHERE published_at IS NULL")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
+    _rebuild_retest_schedules_if_needed()
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_schema(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
